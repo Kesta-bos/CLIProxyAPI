@@ -710,10 +710,14 @@ func (e *ClaudeExecutor) fallbackCountTokensWithAnthropic(
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
-
-	// Use nil auth so that only global proxy settings apply. We still propagate
-	// betas and standard Claude headers for compatibility.
-	applyClaudeHeaders(httpReq, nil, apiKey, false, extraBetas)
+	// Official Anthropic API expects x-api-key rather than Authorization: Bearer
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("x-api-key", apiKey)
+	httpReq.Header.Set("Anthropic-Version", "2023-06-01")
+	if len(extraBetas) > 0 {
+		httpReq.Header.Set("Anthropic-Beta", strings.Join(extraBetas, ","))
+	}
 
 	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
 		URL:       url,
