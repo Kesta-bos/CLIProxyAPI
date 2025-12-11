@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -369,6 +370,16 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		if errClose := resp.Body.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
+
+		// Fallback: some upstreams (e.g., custom proxies) do not implement
+		// /v1/messages/count_tokens. When we see a 404 from a non-Anthropic
+		// baseURL, avoid marking the model as not_found and instead try a
+		// dedicated Anthropic count_tokens API key if configured.
+		if resp.StatusCode == http.StatusNotFound && !isAnthropicBaseURL(baseURL) {
+			log.Debugf("claude count_tokens: upstream %s returned 404, falling back to Anthropic official API", baseURL)
+			return e.fallbackCountTokensWithAnthropic(ctx, upstreamModel, body, from, to, extraBetas)
+		}
+
 		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(b)}
 	}
 	decodedBody, err := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
@@ -658,7 +669,104 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 			continue
 		}
 	}
+
 	return body, nil
+}
+
+// isAnthropicBaseURL reports whether the supplied baseURL points to the official
+// Anthropic API. When true, we should treat HTTP status codes as authoritative
+// from Anthropic rather than from an intermediate proxy.
+func isAnthropicBaseURL(baseURL string) bool {
+	trimmed := strings.TrimSpace(strings.ToLower(baseURL))
+	if trimmed == "" {
+		return true
+	}
+	return strings.Contains(trimmed, "anthropic.com")
+}
+
+// fallbackCountTokensWithAnthropic calls the official Anthropic messages/count_tokens
+// endpoint using a dedicated API key intended only for token counting.
+// The key is read from the ANTHROPIC_COUNT_TOKENS_API_KEY environment variable.
+// This avoids penalizing or suspending the primary Claude auth when an
+// intermediate upstream does not implement count_tokens.
+func (e *ClaudeExecutor) fallbackCountTokensWithAnthropic(
+	ctx context.Context,
+	modelName string,
+	body []byte,
+	from, to sdktranslator.Format,
+	extraBetas []string,
+) (cliproxyexecutor.Response, error) {
+	apiKey := strings.TrimSpace(os.Getenv("ANTHROPIC_COUNT_TOKENS_API_KEY"))
+	if apiKey == "" {
+		log.Warn("claude count_tokens fallback requested but ANTHROPIC_COUNT_TOKENS_API_KEY is not set")
+		return cliproxyexecutor.Response{}, statusErr{
+			code: http.StatusBadGateway,
+			msg:  "claude count_tokens unsupported by upstream and no fallback API key configured",
+		}
+	}
+
+	url := "https://api.anthropic.com/v1/messages/count_tokens?beta=true"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+
+	// Use nil auth so that only global proxy settings apply. We still propagate
+	// betas and standard Claude headers for compatibility.
+	applyClaudeHeaders(httpReq, nil, apiKey, false, extraBetas)
+
+	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+		URL:       url,
+		Method:    http.MethodPost,
+		Headers:   httpReq.Header.Clone(),
+		Body:      body,
+		Provider:  e.Identifier() + "-fallback",
+		AuthID:    "",
+		AuthLabel: "anthropic-count-tokens-fallback",
+		AuthType:  "api_key",
+		AuthValue: util.HideAPIKey(apiKey),
+	})
+
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, nil, 0)
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		recordAPIResponseError(ctx, e.cfg, err)
+		return cliproxyexecutor.Response{}, err
+	}
+	recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		appendAPIResponseChunk(ctx, e.cfg, b)
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("response body close error: %v", errClose)
+		}
+		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(b)}
+	}
+
+	decodedBody, err := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
+	if err != nil {
+		recordAPIResponseError(ctx, e.cfg, err)
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("response body close error: %v", errClose)
+		}
+		return cliproxyexecutor.Response{}, err
+	}
+	defer func() {
+		if errClose := decodedBody.Close(); errClose != nil {
+			log.Errorf("response body close error: %v", errClose)
+		}
+	}()
+
+	data, err := io.ReadAll(decodedBody)
+	if err != nil {
+		recordAPIResponseError(ctx, e.cfg, err)
+		return cliproxyexecutor.Response{}, err
+	}
+	appendAPIResponseChunk(ctx, e.cfg, data)
+
+	count := gjson.GetBytes(data, "input_tokens").Int()
+	out := sdktranslator.TranslateTokenCount(ctx, to, from, count, data)
+	return cliproxyexecutor.Response{Payload: []byte(out)}, nil
 }
 
 func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string) {
